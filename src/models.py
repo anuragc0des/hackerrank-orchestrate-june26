@@ -106,3 +106,30 @@ class DecisionRecord:
     supporting_image_ids: List[str]
     valid_image: bool
     severity: str
+
+
+@dataclass
+class ImageMetadata:
+    """Metadata describing an inspected image during preflight."""
+
+    image_id: str
+    image_path: str
+    filename: str
+    extension: str
+    detected_format: Optional[str]
+    width: Optional[int]
+    height: Optional[int]
+    file_size_bytes: Optional[int]
+    sha256_hash: Optional[str]
+    readable: bool
+    error: Optional[str]
+
+
+@dataclass
+class PreflightResult:
+    """Result of running image preflight on a batch of image paths."""
+
+    valid_images: List[ImageMetadata]
+    invalid_images: List[ImageMetadata]
+    warnings: List[str]
+    total_images: int
