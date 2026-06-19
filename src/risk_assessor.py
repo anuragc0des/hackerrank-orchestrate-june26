@@ -1,0 +1,2 @@
+class RiskAssessor:
+    pass

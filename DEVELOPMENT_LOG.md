@@ -57,3 +57,13 @@
 
 - Created `label_distribution.md`.
 - Appended this entry to `DEVELOPMENT_LOG.md`.
+
+## 2026-06-19T12:40:00+05:30 - Project skeleton creation
+
+### Skeleton work completed
+
+- Created project skeleton directories: `src/`, `evaluation/`, `outputs/`, `cache/`, and `tests/`.
+- Added stub modules for claim parsing, image preflight, image analysis, evidence validation, risk assessment, decision orchestration, pipeline orchestration, and the application entry point.
+- Added `src/models.py` with dataclasses for `ClaimTarget`, `ClaimIntent`, `ImageFinding`, `ImageSetAnalysis`, `EvidenceAssessment`, `RiskAssessment`, and `DecisionRecord`.
+- Added evaluation stub `evaluation/evaluate.py`.
+- Added `project_structure.md` documenting the created structure and file purposes.

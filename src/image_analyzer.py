@@ -1,0 +1,2 @@
+class ImageAnalyzer:
+    pass
