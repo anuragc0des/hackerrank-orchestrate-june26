@@ -32,20 +32,18 @@ class ClaimIntent:
 class ImageFinding:
     """Represents the analysis result for a single image.
 
-    This model is a neutral description of visible content and quality.
+    This model captures the visible object, damage description, quality flags, and confidence.
     """
 
     image_id: str
-    decode_status: str
-    native_format: Optional[str]
-    detected_object: Optional[str]
-    visible_parts: List[str]
-    visible_issue_type: Optional[str]
-    severity: Optional[str]
-    target_visibility: dict[str, str]
-    quality_flags: List[str]
-    trust_flags: List[str]
-    observation: Optional[str]
+    detected_object: str
+    visible_issue_type: str
+    object_part: str
+    severity: str
+    visible_damage: bool
+    image_quality_flags: List[str]
+    confidence: float
+    analysis_notes: str
 
 
 @dataclass
