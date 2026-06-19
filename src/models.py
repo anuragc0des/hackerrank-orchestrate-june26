@@ -38,11 +38,11 @@ class ImageFinding:
     image_id: str
     decode_status: str
     native_format: Optional[str]
-    object: Optional[str]
+    detected_object: Optional[str]
     visible_parts: List[str]
-    visible_issue: Optional[str]
+    visible_issue_type: Optional[str]
     severity: Optional[str]
-    target_visibility: List[str]
+    target_visibility: dict[str, str]
     quality_flags: List[str]
     trust_flags: List[str]
     observation: Optional[str]
