@@ -76,9 +76,21 @@ DEFAULT_ANALYSIS_NOTES = "Image analysis could not be completed."
 class ImageAnalyzer:
     """Analyze image metadata through Gemini and cache results."""
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "gemini-2.5-flash"):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = "gemini-2.5-flash",
+        rate_limit_per_second: Optional[float] = 1.0,
+        batch_size: int = 1,
+        dry_run: bool = False,
+        max_retries: int = 3,
+    ):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         self.model = model
+        self.rate_limit_per_second = rate_limit_per_second
+        self.batch_size = max(1, batch_size)
+        self.dry_run = dry_run
+        self.max_retries = max(1, max_retries)
         self._cache: Dict[str, ImageFinding] = {}
         self.raw_responses: Dict[str, str] = {}
         self.metrics = {
@@ -88,6 +100,7 @@ class ImageAnalyzer:
             "cache_misses": 0,
         }
         self.client = None
+        self._last_gemini_call = 0.0
 
         if self.api_key:
             try:
@@ -128,8 +141,313 @@ class ImageAnalyzer:
         return finding
 
     def analyze_images(self, image_metadatas: List[ImageMetadata]) -> List[ImageFinding]:
-        """Analyze a batch of images one by one."""
-        return [self.analyze_image(metadata) for metadata in image_metadatas]
+        """Analyze a list of images using cache, batching, and optional dry-run mode."""
+        self.metrics["total_images_analyzed"] += len(image_metadatas)
+        findings: List[ImageFinding] = []
+        images_to_analyze: List[ImageMetadata] = []
+
+        for metadata in image_metadatas:
+            cached = self.cache_lookup(metadata.sha256_hash) if metadata.sha256_hash else None
+            if cached is not None:
+                self.metrics["cache_hits"] += 1
+                findings.append(cached)
+            else:
+                if metadata.sha256_hash:
+                    self.metrics["cache_misses"] += 1
+                images_to_analyze.append(metadata)
+
+        if self.dry_run:
+            for metadata in images_to_analyze:
+                findings.append(self._dry_run_finding(metadata))
+            return findings
+
+        for batch in self._chunked(images_to_analyze, self.batch_size):
+            findings.extend(self._analyze_image_batch(batch))
+
+        return findings
+
+    def _chunked(self, items: List[ImageMetadata], chunk_size: int) -> List[List[ImageMetadata]]:
+        return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+    def _dry_run_finding(self, image_metadata: ImageMetadata) -> ImageFinding:
+        logger.info(
+            "Dry-run cache miss for image_id=%s path=%s",
+            image_metadata.image_id,
+            image_metadata.image_path,
+        )
+        return self._fallback_finding(image_metadata, reason="dry run cache miss")
+
+    def _analyze_image_batch(self, image_metadatas: List[ImageMetadata]) -> List[ImageFinding]:
+        results: List[ImageFinding] = []
+        images: List[Image.Image] = []
+
+        try:
+            for metadata in image_metadatas:
+                image = self._open_image(metadata.image_path)
+                images.append(image)
+
+            prompts = [self.build_prompt(metadata) for metadata in image_metadatas]
+            batch_contents = self._build_batch_contents(images, prompts)
+            raw_text = self._call_gemini(batch_contents)
+            batch_texts = self._extract_batch_responses(raw_text, len(image_metadatas))
+
+            for metadata, text in zip(image_metadatas, batch_texts):
+                self.raw_responses[metadata.image_id] = text
+                finding = self.parse_response(text, metadata)
+                if metadata.sha256_hash:
+                    self.cache_store(metadata.sha256_hash, finding)
+                results.append(finding)
+
+            if len(batch_texts) != len(image_metadatas):
+                for missing_metadata in image_metadatas[len(batch_texts) :]:
+                    fallback = self._fallback_finding(missing_metadata, reason="unexpected batch response length")
+                    if missing_metadata.sha256_hash:
+                        self.cache_store(missing_metadata.sha256_hash, fallback)
+                    results.append(fallback)
+        except Exception as exc:
+            logger.error(
+                "Gemini batch analysis failed for image_ids=%s: %s",
+                [metadata.image_id for metadata in image_metadatas],
+                exc,
+            )
+            for metadata in image_metadatas:
+                fallback = self._fallback_finding(metadata, reason=str(exc))
+                if metadata.sha256_hash:
+                    self.cache_store(metadata.sha256_hash, fallback)
+                results.append(fallback)
+        finally:
+            for image in images:
+                try:
+                    image.close()
+                except Exception:
+                    pass
+
+        return results
+
+    def _build_batch_contents(self, images: List[Image.Image], prompts: List[str]) -> List[Any]:
+        contents: List[Any] = []
+        for image, prompt in zip(images, prompts):
+            contents.append(image)
+            contents.append(prompt)
+        return contents
+
+    def _call_gemini(self, contents: List[Any]) -> str:
+        if self.client is None:
+            raise RuntimeError("Gemini client unavailable")
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                self._enforce_rate_limit()
+                self.metrics["gemini_calls_made"] += 1
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=contents,
+                    config={"temperature": 0, "max_output_tokens": 250},
+                )
+                raw_text = getattr(response, "text", None)
+                if raw_text is None and isinstance(response, dict):
+                    raw_text = response.get("text", "")
+                if raw_text is None:
+                    raw_text = str(response)
+                return raw_text
+            except Exception as exc:
+                last_error = exc
+                retry_delay = self._extract_retry_delay(exc)
+                if attempt == self.max_retries or not self._is_retryable_exception(exc):
+                    logger.error("Gemini API call failed on attempt %s: %s", attempt, exc)
+                    raise
+                sleep_time = retry_delay if retry_delay is not None else 2 ** (attempt - 1)
+                logger.warning(
+                    "Gemini API transient failure on attempt %s: %s. Retrying in %ss",
+                    attempt,
+                    exc,
+                    sleep_time,
+                )
+                time.sleep(sleep_time)
+        raise last_error or RuntimeError("Gemini API failed without exception")
+
+    def _enforce_rate_limit(self) -> None:
+        if not self.rate_limit_per_second or self.rate_limit_per_second <= 0:
+            return
+
+        min_interval = 1.0 / self.rate_limit_per_second
+        now = time.perf_counter()
+        elapsed = now - self._last_gemini_call
+        if elapsed < min_interval:
+            sleep_time = min_interval - elapsed
+            logger.debug("Rate limiting Gemini requests: sleeping %.3fs", sleep_time)
+            time.sleep(sleep_time)
+        self._last_gemini_call = time.perf_counter()
+
+    def _extract_batch_responses(self, raw_text: str, expected_count: int) -> List[str]:
+        if not isinstance(raw_text, str) or not raw_text.strip():
+            return []
+
+        response_text = raw_text.strip()
+        json_text = self._extract_json_text(response_text)
+        if json_text:
+            try:
+                decoded = json.loads(json_text)
+                if isinstance(decoded, list):
+                    return [json.dumps(item) if not isinstance(item, str) else item for item in decoded]
+                if isinstance(decoded, dict):
+                    return [json.dumps(decoded)]
+            except Exception:
+                pass
+
+        json_objects = self._extract_json_objects(response_text)
+        if json_objects:
+            return json_objects
+
+        return [response_text]
+
+    def _extract_json_text(self, text: str) -> Optional[str]:
+        if not isinstance(text, str) or not text.strip():
+            return None
+
+        sanitized = self._sanitize_response_text(text)
+        if not sanitized:
+            return None
+
+        if self._is_valid_json(sanitized):
+            return sanitized
+
+        extracted = self._extract_json_objects(sanitized)
+        if extracted:
+            return extracted[0]
+
+        repaired = self._repair_truncated_json(sanitized)
+        if repaired:
+            return repaired
+
+        return None
+
+    def _extract_json_objects(self, text: str) -> List[str]:
+        objects: List[str] = []
+        depth = 0
+        start = -1
+        in_string = False
+        escape = False
+
+        for index, char in enumerate(text):
+            if char == '\\' and not escape:
+                escape = True
+                continue
+            if char == '"' and not escape:
+                in_string = not in_string
+            escape = False
+
+            if in_string:
+                continue
+
+            if char == '{':
+                if depth == 0:
+                    start = index
+                depth += 1
+            elif char == '}':
+                depth -= 1
+                if depth == 0 and start != -1:
+                    objects.append(text[start : index + 1])
+                    start = -1
+
+        return objects
+
+    def _is_valid_json(self, text: str) -> bool:
+        try:
+            json.loads(text)
+            return True
+        except Exception:
+            return False
+
+    def _repair_truncated_json(self, text: str) -> Optional[str]:
+        if not text or text[0] not in "[{":
+            return None
+
+        try:
+            json.loads(text)
+            return text
+        except json.JSONDecodeError:
+            pass
+
+        try:
+            decoder = json.JSONDecoder()
+            _, index = decoder.raw_decode(text)
+            candidate = text[:index].strip()
+            if candidate and self._is_valid_json(candidate):
+                return candidate
+        except Exception:
+            pass
+
+        if text.startswith("{"):
+            unmatched = self._count_unmatched_delimiters(text, "{", "}")
+            if unmatched > 0:
+                repaired = text + "}" * unmatched
+                if self._is_valid_json(repaired):
+                    return repaired
+
+        if text.startswith("["):
+            unmatched = self._count_unmatched_delimiters(text, "[", "]")
+            if unmatched > 0:
+                repaired = text + "]" * unmatched
+                if self._is_valid_json(repaired):
+                    return repaired
+
+        return None
+
+    def _count_unmatched_delimiters(self, text: str, opener: str, closer: str) -> int:
+        depth = 0
+        in_string = False
+        escape = False
+
+        for char in text:
+            if char == "\\" and not escape:
+                escape = True
+                continue
+            if char == '"' and not escape:
+                in_string = not in_string
+            if in_string:
+                escape = False
+                continue
+
+            if char == opener:
+                depth += 1
+            elif char == closer and depth > 0:
+                depth -= 1
+
+            escape = False
+
+        return depth
+
+    def _extract_retry_delay(self, exc: Exception) -> Optional[float]:
+        retry_info = getattr(exc, "retry_info", None)
+        if retry_info is not None:
+            retry_delay = getattr(retry_info, "retry_delay", None) or getattr(retry_info, "delay", None)
+            if retry_delay is not None:
+                if hasattr(retry_delay, "seconds") or hasattr(retry_delay, "nanos"):
+                    seconds = float(getattr(retry_delay, "seconds", 0))
+                    nanos = float(getattr(retry_delay, "nanos", 0)) / 1_000_000_000
+                    return max(0.0, seconds + nanos)
+                if isinstance(retry_delay, (int, float)):
+                    return float(retry_delay)
+
+        retry_after = getattr(exc, "retry_after", None)
+        if isinstance(retry_after, (int, float)):
+            return float(retry_after)
+
+        message = str(exc).lower()
+        if "retry-after" in message:
+            import re as _re
+
+            match = _re.search(r"retry-after\s*[:=]?\s*(\d+)", message)
+            if match:
+                return float(match.group(1))
+
+        return None
+
+    def call_gemini(self, prompt: str, image: Image.Image) -> str:
+        contents = [image, prompt]
+        return self._call_gemini(contents)
 
     def build_prompt(self, image_metadata: ImageMetadata) -> str:
         """Build a strict Gemini prompt for image analysis."""
@@ -166,45 +484,10 @@ class ImageAnalyzer:
             "\"analysis_notes\": \"Rear bumper dent clearly visible.\"}\n"
         )
 
-    def call_gemini(self, prompt: str, image: Image.Image) -> str:
-        """Call Gemini Vision with the image and prompt, retrying on transient failures."""
-        if self.client is None:
-            raise RuntimeError("Gemini client unavailable")
-
-        last_error: Optional[Exception] = None
-        for attempt in range(1, 4):
-            try:
-                self.metrics["gemini_calls_made"] += 1
-                response = self.client.models.generate_content(
-                    model=self.model,
-                    contents=[image, prompt],
-                    temperature=0,
-                    max_output_tokens=250,
-                )
-                raw_text = getattr(response, "text", None)
-                if raw_text is None and isinstance(response, dict):
-                    raw_text = response.get("text", "")
-                if raw_text is None:
-                    raw_text = str(response)
-                return raw_text
-            except Exception as exc:
-                last_error = exc
-                if attempt == 3 or not self._is_retryable_exception(exc):
-                    logger.error("Gemini API call failed on attempt %s: %s", attempt, exc)
-                    raise
-                sleep_time = 2 ** (attempt - 1)
-                logger.warning(
-                    "Gemini API transient failure on attempt %s: %s. Retrying in %ss",
-                    attempt,
-                    exc,
-                    sleep_time,
-                )
-                time.sleep(sleep_time)
-        raise last_error or RuntimeError("Gemini API failed without exception")
-
     def parse_response(self, response_text: str, image_metadata: ImageMetadata) -> ImageFinding:
         """Parse and validate the Gemini JSON response."""
-        response_text = self._sanitize_response_text(response_text)
+        json_text = self._extract_json_text(response_text)
+        response_text = json_text if json_text is not None else self._sanitize_response_text(response_text)
 
         def normalize_enum(value: Any, allowed: set[str], default: str) -> str:
             if isinstance(value, str):
@@ -303,27 +586,53 @@ class ImageAnalyzer:
         """Return True for temporary Gemini or network failures."""
         if isinstance(exc, (TimeoutError, ConnectionError)):
             return True
+
+        retry_info = getattr(exc, "retry_info", None)
+        if retry_info is not None:
+            return True
+
+        retry_after = getattr(exc, "retry_after", None)
+        if retry_after is not None:
+            return True
+
         message = str(exc).lower()
-        retry_keywords = ["timeout", "timed out", "rate limit", "429", "temporary", "service unavailable", "connection reset", "connection aborted", "network"]
+        retry_keywords = [
+            "timeout",
+            "timed out",
+            "rate limit",
+            "quota",
+            "429",
+            "temporary",
+            "service unavailable",
+            "connection reset",
+            "connection aborted",
+            "network",
+        ]
         return any(keyword in message for keyword in retry_keywords)
 
     def _sanitize_response_text(self, response_text: str) -> str:
         """Extract plain JSON from fenced or noisy Gemini responses."""
         if not isinstance(response_text, str):
             return ""
+
         text = response_text.strip()
         # Remove markdown fences if present.
-        fenced = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-        fenced = re.sub(r"\s*```$", "", fenced, flags=re.IGNORECASE)
-        text = fenced.strip()
-        # Prefer direct JSON if valid.
-        if text.startswith("{") and text.endswith("}"):
-            return text
-        first = text.find("{")
-        last = text.rfind("}")
-        if first != -1 and last != -1 and last > first:
-            return text[first:last + 1]
-        return text
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text, flags=re.IGNORECASE)
+        # Remove wrappers like response= or result= if present.
+        text = re.sub(r"^(?:response|result|output)\s*=\s*", "", text, flags=re.IGNORECASE)
+        text = text.strip()
+
+        # Extract substring from first JSON start marker.
+        first_curly = text.find("{")
+        first_square = text.find("[")
+        starts = [idx for idx in (first_curly, first_square) if idx != -1]
+        if starts:
+            first_marker = min(starts)
+            if first_marker > 0:
+                text = text[first_marker:]
+
+        return text.strip()
 
     def cache_store(self, sha256_hash: Optional[str], finding: ImageFinding) -> None:
         """Store analysis result in memory cache."""

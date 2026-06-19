@@ -261,3 +261,189 @@ def test_fenced_json_sanitization(monkeypatch):
     assert finding.visible_issue_type == "torn_packaging"
     assert analyzer.raw_responses[image_metadata.image_id] == fenced
     Path(temp_file.name).unlink()
+
+
+def test_truncated_json_repair(monkeypatch):
+    analyzer = ImageAnalyzer()
+    truncated = '{"detected_object": "car", "visible_issue_type": "dent", "object_part": "rear_bumper", "severity": "medium", "visible_damage": true, "image_quality_flags": [], "confidence": 0.92, "analysis_notes": "Dent visible"'
+    monkeypatch.setattr(analyzer, "call_gemini", lambda prompt, image=None: truncated)
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+    temp_file.close()
+    Image.new("RGB", (10, 10), color="blue").save(temp_file.name, format="JPEG")
+    image_metadata = sample_metadata()
+    image_metadata.image_path = temp_file.name
+
+    finding = analyzer.analyze_image(image_metadata)
+
+    assert finding.detected_object == "car"
+    assert finding.analysis_notes == "Dent visible"
+    Path(temp_file.name).unlink()
+
+
+def test_response_wrapper_and_json_extraction(monkeypatch):
+    analyzer = ImageAnalyzer()
+    wrapper = 'response={\n  "detected_object": "laptop",\n  "visible_issue_type": "crack",\n  "object_part": "screen",\n  "severity": "high",\n  "visible_damage": true,\n  "image_quality_flags": [],\n  "confidence": 0.72,\n  "analysis_notes": "Screen crack visible."\n}'
+    monkeypatch.setattr(analyzer, "call_gemini", lambda prompt, image=None: wrapper)
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+    temp_file.close()
+    Image.new("RGB", (10, 10), color="blue").save(temp_file.name, format="JPEG")
+    image_metadata = sample_metadata()
+    image_metadata.image_path = temp_file.name
+
+    finding = analyzer.analyze_image(image_metadata)
+
+    assert finding.detected_object == "laptop"
+    assert finding.object_part == "screen"
+    Path(temp_file.name).unlink()
+
+
+def test_batch_processes_multiple_images(tmp_path):
+    analyzer = ImageAnalyzer(batch_size=2, rate_limit_per_second=0)
+    raw_json = json.dumps([
+        {
+            "detected_object": "car",
+            "visible_issue_type": "dent",
+            "object_part": "rear_bumper",
+            "severity": "medium",
+            "visible_damage": True,
+            "image_quality_flags": [],
+            "confidence": 0.9,
+            "analysis_notes": "Dent visible.",
+        },
+        {
+            "detected_object": "laptop",
+            "visible_issue_type": "crack",
+            "object_part": "screen",
+            "severity": "high",
+            "visible_damage": True,
+            "image_quality_flags": [],
+            "confidence": 0.8,
+            "analysis_notes": "Screen crack visible.",
+        },
+    ])
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            return DummyResponse(raw_json)
+
+    analyzer.client = type("C", (), {"models": FakeModels()})()
+    temp_file_1 = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+    temp_file_1.close()
+    Image.new("RGB", (10, 10), color="blue").save(temp_file_1.name, format="JPEG")
+    temp_file_2 = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+    temp_file_2.close()
+    Image.new("RGB", (10, 10), color="red").save(temp_file_2.name, format="JPEG")
+
+    metadata_1 = sample_metadata()
+    metadata_1.image_path = temp_file_1.name
+    metadata_1.sha256_hash = "hash1"
+    metadata_2 = sample_metadata()
+    metadata_2.image_id = "img_2"
+    metadata_2.image_path = temp_file_2.name
+    metadata_2.sha256_hash = "hash2"
+
+    findings = analyzer.analyze_images([metadata_1, metadata_2])
+
+    assert len(findings) == 2
+    assert findings[0].detected_object == "car"
+    assert findings[1].detected_object == "laptop"
+    assert analyzer.metrics["gemini_calls_made"] == 1
+    Path(temp_file_1.name).unlink()
+    Path(temp_file_2.name).unlink()
+
+
+def test_dry_run_uses_cached_responses_only(tmp_path, monkeypatch):
+    analyzer = ImageAnalyzer(dry_run=True, batch_size=2, rate_limit_per_second=0)
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+    temp_file.close()
+    Image.new("RGB", (10, 10), color="blue").save(temp_file.name, format="JPEG")
+    metadata = sample_metadata()
+    metadata.image_path = temp_file.name
+
+    monkeypatch.setattr(analyzer, "_call_gemini", lambda contents: (_ for _ in ()).throw(AssertionError("Should not call Gemini")))
+    findings = analyzer.analyze_images([metadata])
+
+    assert len(findings) == 1
+    assert findings[0].detected_object == "unknown"
+    assert analyzer.metrics["gemini_calls_made"] == 0
+    assert "dry run" in findings[0].analysis_notes
+    Path(temp_file.name).unlink()
+
+
+def test_respects_retry_info_delay(monkeypatch, tmp_path):
+    analyzer = ImageAnalyzer(rate_limit_per_second=0, max_retries=3)
+    sleep_calls: list[float] = []
+
+    class RetryDelay:
+        seconds = 1
+        nanos = 500000000
+
+    class RetryException(Exception):
+        pass
+
+    exc = RetryException("quota exceeded")
+    exc.retry_info = type("RetryInfo", (), {"retry_delay": RetryDelay()})()
+
+    count = {"calls": 0}
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            count["calls"] += 1
+            if count["calls"] == 1:
+                raise exc
+            return DummyResponse(json.dumps({
+                "detected_object": "car",
+                "visible_issue_type": "dent",
+                "object_part": "rear_bumper",
+                "severity": "medium",
+                "visible_damage": True,
+                "image_quality_flags": [],
+                "confidence": 0.8,
+                "analysis_notes": "Dent visible.",
+            }))
+
+    analyzer.client = type("C", (), {"models": FakeModels()})()
+    monkeypatch.setattr("src.image_analyzer.time.sleep", lambda seconds: sleep_calls.append(seconds))
+
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+    temp_file.close()
+    Image.new("RGB", (10, 10), color="blue").save(temp_file.name, format="JPEG")
+    metadata = sample_metadata()
+    metadata.image_path = temp_file.name
+
+    findings = analyzer.analyze_images([metadata])
+
+    assert findings[0].detected_object == "car"
+    assert count["calls"] == 2
+    assert sleep_calls == [1.5]
+    Path(temp_file.name).unlink()
+
+
+def test_quota_failure_does_not_stop_batch(monkeypatch, tmp_path):
+    analyzer = ImageAnalyzer(batch_size=2, rate_limit_per_second=0)
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            raise RuntimeError("quota exceeded")
+
+    analyzer.client = type("C", (), {"models": FakeModels()})()
+    temp_file_1 = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+    temp_file_1.close()
+    Image.new("RGB", (10, 10), color="blue").save(temp_file_1.name, format="JPEG")
+    temp_file_2 = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+    temp_file_2.close()
+    Image.new("RGB", (10, 10), color="red").save(temp_file_2.name, format="JPEG")
+
+    metadata_1 = sample_metadata()
+    metadata_1.image_path = temp_file_1.name
+    metadata_2 = sample_metadata()
+    metadata_2.image_id = "img_2"
+    metadata_2.image_path = temp_file_2.name
+
+    findings = analyzer.analyze_images([metadata_1, metadata_2])
+
+    assert len(findings) == 2
+    assert all(f.detected_object == "unknown" for f in findings)
+    assert analyzer.metrics["gemini_calls_made"] == 3
+    Path(temp_file_1.name).unlink()
+    Path(temp_file_2.name).unlink()

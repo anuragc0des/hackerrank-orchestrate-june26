@@ -110,6 +110,26 @@ You are free to use any language or runtime. Python, JavaScript, and TypeScript 
 
 ---
 
+## Gemini Throughput and Free-Tier Notes
+
+This pipeline is designed to reduce Gemini free-tier load by:
+
+- batching multiple images in a single `generate_content` request when `--batch-size` is greater than `1`
+- applying an optional `--rate-limit` to limit Gemini calls per second
+- using cached responses whenever available and a `--dry-run` mode to avoid new API calls
+- respecting Gemini retry delays when retry information is provided by the API
+- continuing pipeline execution when quota or transient Gemini failures occur, producing fallback analysis results rather than stopping the run
+
+Example runner usage:
+
+```bash
+python run.py --input dataset/sample_claims.csv --max-images 10 --rate-limit 0.5 --batch-size 2 --dry-run
+```
+
+Use `--max-images N` to limit work for testing purposes.
+
+---
+
 ## Evaluation
 
 The evaluation report should include:
