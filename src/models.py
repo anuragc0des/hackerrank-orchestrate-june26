@@ -74,17 +74,12 @@ class EvidenceAssessment:
 
 @dataclass
 class RiskAssessment:
-    """Represents the risk assessment derived from image and history context.
+    """Represents the risk assessment derived from user history context."""
 
-    This model captures canonical risk flags and manual review rationale.
-    """
-
-    history_found: bool
-    history_flags: List[str]
-    image_flags: List[str]
-    decision_context_flags: List[str]
     risk_flags: List[str]
-    manual_review_reason: Optional[str]
+    risk_score: int
+    manual_review_required: bool
+    risk_reason: Optional[str]
 
 
 @dataclass
